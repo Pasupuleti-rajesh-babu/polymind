@@ -1,0 +1,62 @@
+# Virtual Environment
+/.polymindenv/
+venv/
+*.venv/
+
+# Python Bytecode and Compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+develop-eggs/
+parts/
+sdist/
+var/
+wheels/
+*.tar.gz
+*.whl
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Secrets and Credentials (best practice, even if handled by env vars)
+*.env
+*.env.*
+credentials.json
+secrets.yaml
+secrets.yml
+# Add any other files that might contain sensitive information
+
+# FAISS index files (if saved locally)
+*.faiss
+
+# Matplotlib figures (if saved automatically and not intended for version control)
+# *.png
+# *.jpg
+# *.svg
+
+# Log files
+*.log
+logs/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints
+
+# Temporary files
+*.tmp
+*.swp
+*~ 
