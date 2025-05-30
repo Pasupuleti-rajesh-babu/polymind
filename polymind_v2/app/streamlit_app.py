@@ -2,14 +2,11 @@ import streamlit as st
 import os
 import sys
 
+# Add the parent directory of the app to sys.path for sibling imports
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 # --- Page Configuration (MUST BE THE FIRST STREAMLIT COMMAND) ---
 st.set_page_config(page_title="PolyMind V2", layout="wide")
-
-# Add project root to sys.path
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_script_dir)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
 
 # Attempt to import streamlit-agraph components
 streamlit_agraph_loaded = False
@@ -41,6 +38,10 @@ try:
         find_analogous_concepts_structural_graph,
         generate_analogy_explanation_gemini
     )
+    # Import the new ChatOrchestrator and other modules it might need directly
+    from polymind_core.chat_interface.chat_orchestrator import ChatOrchestrator
+    from polymind_core.synthesis_engine import feature_extractor, blender, analogy_finder # For passing modules to orchestrator
+
     import config
 except ImportError as e:
     st.error(f"Error importing modules: {e}. Please ensure all components are correctly installed and paths are set up.")
@@ -86,6 +87,35 @@ graph_handler = get_graph_handler()
 text_processor = get_text_processor()
 faiss_handler = get_faiss_handler()
 
+# --- Chat Orchestrator Initialization ---
+@st.cache_resource
+def get_chat_orchestrator(_graph_handler, _faiss_handler, _text_processor, _feature_extractor_module, _blender_module, _analogy_finder_module):
+    if not _graph_handler or not _faiss_handler or not _text_processor:
+        st.warning("Chat Orchestrator cannot be fully initialized as some core handlers are missing.")
+        return None
+    try:
+        return ChatOrchestrator(
+            graph_handler=_graph_handler,
+            faiss_handler=_faiss_handler,
+            text_processor=_text_processor,
+            feature_extractor=_feature_extractor_module, # Pass the module itself
+            blender=_blender_module,                   # Pass the module itself
+            analogy_finder=_analogy_finder_module      # Pass the module itself
+        )
+    except Exception as e:
+        st.error(f"Failed to initialize Chat Orchestrator: {e}")
+        return None
+
+chat_orchestrator = get_chat_orchestrator(
+    graph_handler, 
+    faiss_handler, 
+    text_processor,
+    feature_extractor, # Pass the imported module
+    blender,           # Pass the imported module
+    analogy_finder     # Pass the imported module
+)
+# --- End Chat Orchestrator Initialization ---
+
 if not graph_handler or not text_processor or not faiss_handler:
     st.error("Core handlers could not be initialized. Application cannot proceed.")
     st.stop()
@@ -108,10 +138,47 @@ st.title("🧠 PolyMind V2 - Knowledge Synthesis System")
 # Sidebar for navigation
 st.sidebar.title("Navigation")
 app_mode = st.sidebar.radio("Choose a section:", 
-    ("Knowledge Ingestion", "Knowledge Browser", "Conceptual Blending", "Analogical Search"))
+    ("PolyMind Chat", "Knowledge Ingestion", "Knowledge Browser", "Conceptual Blending", "Analogical Search"))
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- PolyMind Chat ---
+if app_mode == "PolyMind Chat":
+    st.header("💬 PolyMind Chat")
+    st.info("Ask me about concepts, blend ideas, or find analogies! Try: 'What is Concept X?', 'Blend Y and Z', 'Find analogies for A'.")
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Accept user input
+    if prompt := st.chat_input("What can PolyMind help you with today?"):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Get assistant response
+        if chat_orchestrator:
+            with st.spinner("PolyMind is thinking..."):
+                assistant_response = chat_orchestrator.parse_and_execute_command(prompt)
+            # Add assistant response to chat history
+            st.session_state.messages.append({"role": "assistant", "content": assistant_response})
+            # Display assistant response in chat message container
+            with st.chat_message("assistant"):
+                st.markdown(assistant_response)
+        else:
+            st.error("Chat orchestrator is not available. Cannot process request.")
+            st.session_state.messages.append({"role": "assistant", "content": "Sorry, the chat system is currently unavailable."})
+            with st.chat_message("assistant"):
+                 st.markdown("Sorry, the chat system is currently unavailable.")
 
 # --- 1. Knowledge Ingestion ---
-if app_mode == "Knowledge Ingestion":
+elif app_mode == "Knowledge Ingestion":
     st.header("📚 Knowledge Ingestion")
     st.subheader("Ingest Content from Wikipedia")
 
