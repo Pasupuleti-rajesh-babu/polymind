@@ -1,0 +1,8 @@
+python-dotenv
+py2neo
+google-generativeai
+sentence-transformers
+faiss-cpu
+wikipedia
+streamlit
+# Add other core dependencies as they become clear, e.g., numpy, networkx, matplotlib for UI later 
