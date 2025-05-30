@@ -265,6 +265,111 @@ class GraphHandler:
             logger.error(f"Error executing Cypher query: {e}. Query: {query[:100]}... Params: {parameters}")
             return []
 
+    def get_agraph_data_for_concept(self, concept_name: str, max_neighbors: int = 10) -> Dict[str, List[Dict]]:
+        """
+        Retrieves data for a concept and its 1-hop neighborhood, formatted for streamlit-agraph.
+
+        Args:
+            concept_name (str): The name of the central concept.
+            max_neighbors (int): Max number of neighbors (combined outgoing/incoming) to show.
+
+        Returns:
+            Dict[str, List[Dict]]: A dictionary with "nodes" and "edges" lists.
+                                   Nodes: [{'id': 'Name', 'label': 'Name', 'title': 'Domain: ...', 'color': '...'}]
+                                   Edges: [{'source': 'SourceNode', 'target': 'TargetNode', 'label': 'REL_TYPE'}]
+                                   Returns empty lists if concept not found or error.
+        """
+        graph = self._get_graph()
+        if not graph:
+            logger.error("Neo4j connection not available for agraph data.")
+            return {"nodes": [], "edges": []}
+
+        norm_concept_name = concept_name.strip().capitalize()
+        nodes = []
+        edges = []
+        node_ids = set()
+
+        try:
+            # Get central concept properties to determine its color and add it as a node
+            concept_props_query = "MATCH (c:Concept {name: $concept_name}) RETURN c.name as name, c.domain as domain"
+            concept_prop_result = self.run_cypher_query(concept_props_query, {"concept_name": norm_concept_name})
+
+            if not concept_prop_result or not concept_prop_result[0]:
+                logger.warning(f"Concept '{norm_concept_name}' not found for agraph visualization.")
+                return {"nodes": [], "edges": []}
+            
+            central_concept_data = concept_prop_result[0]
+            central_name = central_concept_data['name']
+            central_domain = central_concept_data.get('domain', config.DEFAULT_DOMAIN)
+            
+            nodes.append({
+                "id": central_name,
+                "label": central_name,
+                "title": f"Domain: {central_domain}",
+                "color": "#FF69B4" # Pink for central concept
+            })
+            node_ids.add(central_name)
+
+            # Query for 1-hop neighbors and relationships
+            # Combine outgoing and incoming, then limit
+            query = f"""
+            MATCH (c:Concept {{name: $concept_name}})
+            CALL apoc.path.subgraphNodes(c, {{maxLevel: 1, relationshipFilter: '>'}}) YIELD node AS neighbor
+            WITH c, collect(neighbor) as outgoing_neighbors
+            CALL apoc.path.subgraphNodes(c, {{maxLevel: 1, relationshipFilter: '<'}}) YIELD node AS neighbor_in
+            WITH c, outgoing_neighbors, collect(neighbor_in) as incoming_neighbors
+            WITH c, apoc.coll.toSet(outgoing_neighbors + incoming_neighbors) as all_neighbors_nodes
+            UNWIND all_neighbors_nodes as n
+            MATCH path = (c)-[r]-(n)
+            WHERE n <> c AND type(r) IN $allowed_types
+            RETURN c.name as source_name, c.domain as source_domain,
+                   type(r) as rel_type, 
+                   n.name as target_name, n.domain as target_domain,
+                   startNode(r) = c as is_outgoing
+            LIMIT $limit
+            """
+            allowed_types_list = list(config.ALLOWED_RELATIONSHIP_TYPES)
+            results = self.run_cypher_query(query, {
+                "concept_name": norm_concept_name,
+                "allowed_types": allowed_types_list,
+                "limit": max_neighbors
+            })
+
+            for record in results:
+                src_name = record['source_name']
+                src_domain = record.get('source_domain', config.DEFAULT_DOMAIN)
+                rel_type = record['rel_type']
+                tgt_name = record['target_name']
+                tgt_domain = record.get('target_domain', config.DEFAULT_DOMAIN)
+                is_outgoing = record['is_outgoing']
+
+                # Determine actual source and target for the edge based on direction relative to central concept
+                edge_source, edge_target = (central_name, tgt_name) if src_name == central_name else (src_name, central_name)
+                neighbor_node_name = tgt_name if src_name == central_name else src_name
+                neighbor_node_domain = tgt_domain if src_name == central_name else src_domain
+
+                if neighbor_node_name not in node_ids:
+                    nodes.append({
+                        "id": neighbor_node_name,
+                        "label": neighbor_node_name,
+                        "title": f"Domain: {neighbor_node_domain}",
+                        "color": "#ADD8E6" # Light blue for neighbors
+                    })
+                    node_ids.add(neighbor_node_name)
+                
+                edges.append({
+                    "source": edge_source,
+                    "target": edge_target,
+                    "label": rel_type
+                })
+
+            logger.info(f"Retrieved {len(nodes)} nodes and {len(edges)} edges for agraph visualization of '{norm_concept_name}'.")
+            return {"nodes": nodes, "edges": edges}
+
+        except Exception as e:
+            logger.error(f"Error retrieving agraph data for '{norm_concept_name}': {e}", exc_info=True)
+            return {"nodes": [], "edges": []}
+
 # Keep the test routines, but they will need to be updated to instantiate GraphHandler
 if __name__ == '__main__':
     logger.info("Running graph_handler.py tests...")

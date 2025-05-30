@@ -11,7 +11,7 @@ dotenv_path = os.path.join(PROJECT_ROOT, '.env') # Should resolve to polymind_v2
 load_dotenv(dotenv_path)
 
 # --- API Keys & Credentials ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY_HERE") # Ensure placeholder is generic
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyDuSjazaZTKq4TJJGnpz8P8IvDOFqOA3cc") # Ensure placeholder is generic
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "polymind")

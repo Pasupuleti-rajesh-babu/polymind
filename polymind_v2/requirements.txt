@@ -1,8 +1,10 @@
 python-dotenv
 py2neo
 google-generativeai
+protobuf~=5.26.1
 sentence-transformers
 faiss-cpu
 wikipedia
 streamlit
+streamlit-agraph
 # Add other core dependencies as they become clear, e.g., numpy, networkx, matplotlib for UI later 

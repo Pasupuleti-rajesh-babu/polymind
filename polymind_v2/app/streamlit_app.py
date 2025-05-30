@@ -2,11 +2,32 @@ import streamlit as st
 import os
 import sys
 
+# --- Page Configuration (MUST BE THE FIRST STREAMLIT COMMAND) ---
+st.set_page_config(page_title="PolyMind V2", layout="wide")
+
 # Add project root to sys.path
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_script_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+# Attempt to import streamlit-agraph components
+streamlit_agraph_loaded = False
+agraph_module = None
+Node_module = None
+Edge_module = None
+Config_module = None
+
+try:
+    from streamlit_agraph import agraph as agraph_mod, Node as Node_mod, Edge as Edge_mod, Config as Config_mod
+    streamlit_agraph_loaded = True
+    agraph_module = agraph_mod
+    Node_module = Node_mod
+    Edge_module = Edge_mod
+    Config_module = Config_mod
+except ImportError:
+    # Error will be displayed later, after set_page_config
+    pass 
 
 try:
     from polymind_core.knowledge_graph.graph_handler import GraphHandler
@@ -25,8 +46,9 @@ except ImportError as e:
     st.error(f"Error importing modules: {e}. Please ensure all components are correctly installed and paths are set up.")
     st.stop()
 
-# --- Page Configuration ---
-st.set_page_config(page_title="PolyMind V2", layout="wide")
+# Display error for streamlit-agraph if it failed to load (after set_page_config)
+if not streamlit_agraph_loaded:
+    st.error("streamlit-agraph library not found or failed to load. Graph visualizations will be unavailable. Please install it: pip install streamlit-agraph")
 
 # --- Helper Functions & State Management ---
 @st.cache_resource
@@ -166,6 +188,54 @@ elif app_mode == "Knowledge Browser":
                             st.markdown("No relationships with allowed types found for this concept within the display limit.")
                     else:
                         st.markdown("No relationships found for this concept.")
+
+                    # Display interactive graph using streamlit-agraph
+                    if streamlit_agraph_loaded and agraph_module:
+                        st.markdown("**Interactive Graph Visualization:**")
+                        agraph_data = graph_handler.get_agraph_data_for_concept(selected_concept_name, max_neighbors=10)
+                        
+                        agraph_nodes = []
+                        agraph_edges = []
+
+                        if agraph_data["nodes"]:
+                            for node_data in agraph_data["nodes"]:
+                                agraph_nodes.append(Node_module(id=node_data["id"], 
+                                                       label=node_data["label"], 
+                                                       title=node_data.get("title", ""), 
+                                                       color=node_data.get("color", "#ADD8E6"),
+                                                       size=25 if node_data["id"] == selected_concept_name else 15)
+                                                   )
+                            for edge_data in agraph_data["edges"]:
+                                agraph_edges.append(Edge_module(source=edge_data["source"], 
+                                                        target=edge_data["target"], 
+                                                        label=edge_data.get("label", ""))
+                                                   )
+                            
+                            # Configure graph appearance
+                            config_obj = Config_module(width=750,
+                                            height=600,
+                                            directed=True, 
+                                            physics=True, # Enable physics for a more dynamic layout
+                                            hierarchical=False,
+                                            # nodeHighlightBehavior=True, 
+                                            highlightColor="#F7A7A6",
+                                            collapsible=True,
+                                            node={'labelProperty':'label'},
+                                            link={'labelProperty': 'label', 'renderLabel': True}
+                                            # Add more configuration as needed
+                                            )
+                            try:
+                                return_value = agraph_module(nodes=agraph_nodes, edges=agraph_edges, config=config_obj)
+                                if not agraph_nodes: # Double check if still no nodes after call
+                                     st.caption("No graph data to display for this concept, or APOC procedures might be missing in Neo4j.")
+                            except Exception as agraph_e:
+                                st.error(f"Error rendering graph with streamlit-agraph: {agraph_e}")
+                                st.caption("Ensure APOC procedures are installed and enabled in your Neo4j instance if the query uses them.")
+                        else:
+                            st.caption("No graph data available for visualization. This might be due to the concept having no connections or an issue fetching data. Ensure APOC is enabled in Neo4j if used by the query.")
+                    elif not streamlit_agraph_loaded:
+                        st.info("Graph visualization feature is unavailable because the streamlit-agraph library could not be loaded.")
+
                 else:
                     st.warning(f"Could not retrieve details for {selected_concept_name}.")
         elif not graph_handler:
@@ -204,17 +274,14 @@ elif app_mode == "Conceptual Blending":
                                 st.error("Could not retrieve sufficient context for one or both concepts.")
                             else:
                                 blend_result = blend_concepts_gemini(
-                                    text_processor.get_model(), # Pass the Gemini model instance
-                                    context1, 
-                                    context2, 
-                                    concept1_name, 
-                                    concept2_name
+                                    concept_a_context=context1,
+                                    concept_b_context=context2
                                 )
                                 if blend_result:
-                                    st.subheader(f"Blended Concept: {blend_result.get('name', 'Unnamed Blend')}")
+                                    st.subheader(f"Blended Concept: {blend_result.get('blended_name', 'Unnamed Blend')}")
                                     st.markdown(f"**Description:** {blend_result.get('description', 'No description provided.')}")
                                     
-                                    features = blend_result.get('features', [])
+                                    features = blend_result.get('combined_features', [])
                                     if features:
                                         st.markdown("**Key Features:**")
                                         for feature in features:
