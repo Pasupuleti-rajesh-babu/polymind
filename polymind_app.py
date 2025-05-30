@@ -2,14 +2,60 @@ import spacy
 import streamlit as st
 import networkx as nx
 import matplotlib.pyplot as plt
-from py2neo import Graph, Node, Relationship # Added Node, Relationship
-import faiss # Added
-from sentence_transformers import SentenceTransformer # Added
-import numpy as np # Added (ensure it's imported)
-import re # For regex in Streamlit query parsing
-import os # Added for environment variables
-import google.generativeai as genai # Added for Gemini API
-# from transformers import pipeline # For LLM-based extraction
+from py2neo import Graph, Node, Relationship, Subgraph
+import faiss
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import re
+import os
+import google.generativeai as genai
+import logging
+from textwrap import dedent
+import time
+import json
+from enum import Enum
+from dotenv import load_dotenv
+from typing import Iterable, List, Dict, Set, Tuple, Optional
+
+# --- Constants for Schema (Restoring from user patch / previous state) ---
+ALLOWED_RELATIONSHIP_TYPES: set[str] = {
+    "IS_A",               # taxonomic
+    "PART_OF",            # mereology
+    "HAS_PROPERTY",       # attributes / qualities
+    "CAUSES",             # causal
+    "ENABLES",            # pre-condition / affordance
+    "USED_FOR",           # functional purpose
+    "LOCATED_IN",         # spatial containment
+    "EXHIBITS",           # displays behaviour / phenotype
+    "HAS_COMPONENT",      # direct compositional link
+    "OCCURS_AROUND",      # contextual co-occurrence
+    "OBSERVED_IN",        # empirical observation site
+    "CONCEPTUALLY_RELATED_TO",  # broad conceptual link
+    "RELATED_TO"          # catch-all (use sparingly)
+}
+
+_REL_MAP = {
+    # Causal variants
+    "LEADS_TO": "CAUSES",
+    "RESULTS_IN": "CAUSES",
+    "CAUSE": "CAUSES",
+    # Part/whole synonyms
+    "COMPONENT_OF": "PART_OF",
+    "BELONGS_TO": "PART_OF",
+    # Attribute variants
+    "HAS_ATTRIBUTE": "HAS_PROPERTY",
+    "IS_CHARACTERIZED_BY": "HAS_PROPERTY",
+    # Spatial
+    "IN": "LOCATED_IN",
+    "INSIDE": "LOCATED_IN",
+    # Fallback for common variations that Gemini might produce if it slips
+    "IS_RELATED_TO": "RELATED_TO",
+    "RELATED": "RELATED_TO",
+    "IS_A_TYPE_OF": "IS_A",
+    "TYPE_OF": "IS_A",
+    "PART": "PART_OF"
+}
+# --- END Constants for Schema ---
 
 # --- Streamlit UI Setup (MUST BE FIRST STREAMLIT COMMANDS) ---
 st.set_page_config(layout="wide")
@@ -77,30 +123,37 @@ except OSError:
 # --- Sample Data Definition (can be expanded or moved) ---
 # Defined globally to be accessible by init and potentially __main__ if needed elsewhere.
 SAMPLE_CONCEPTS_TO_LOAD = list(set([
-    "DNA", "Cell", "Evolution", "Gene", "Protein", "Neuron", "RNA", "Immune system", "Metabolism", "Species",
-    "Meme", "Dualism", "Metaphysics", "Epistemology", "Dialectic", "Consciousness", "Idea", "Logic", "Mind–body problem", "Ethics",
-    "genetic instructions", "living organisms", "unit of cultural information", 
-    "Monism", "basic unit of life", "elementary individual substance"
+    c.capitalize() for c in [
+        "DNA", "Cell", "Evolution", "Gene", "Protein", "Neuron", "RNA", "Immune system", "Metabolism", "Species",
+        "Meme", "Dualism", "Metaphysics", "Epistemology", "Dialectic", "Consciousness", "Idea", "Logic", "Mind–body problem", "Ethics",
+        "genetic instructions", "living organisms", "unit of cultural information", 
+        "Monism", "basic unit of life", "elementary individual substance"
+    ]
 ]))
 
 SAMPLE_TRIPLES_TO_LOAD = [
-    ("DNA", "CARRIES", "genetic instructions"), ("DNA", "IN", "living organisms"),
-    ("Meme", "IS_A", "unit of cultural information"), ("DNA", "CODES_FOR", "Protein"),
-    ("Meme", "SUBCONCEPT_OF", "Idea"), ("Evolution", "APPLIES_TO", "Species"),
-    ("Dualism", "CONTRASTS_WITH", "Monism"),
-    ("Cell", "IS_A", "basic unit of life"), 
-    ("Monad", "IS_A", "elementary individual substance") # Assuming Monad is in SAMPLE_CONCEPTS
+    (s.capitalize(), r, o.capitalize()) for s, r, o in [
+        ("DNA", "CARRIES", "genetic instructions"), ("DNA", "IN", "living organisms"),
+        ("Meme", "IS_A", "unit of cultural information"), ("DNA", "CODES_FOR", "Protein"),
+        ("Meme", "SUBCONCEPT_OF", "Idea"), ("Evolution", "APPLIES_TO", "Species"),
+        ("Dualism", "CONTRASTS_WITH", "Monism"),
+        ("Cell", "IS_A", "basic unit of life"), 
+        ("Monad", "IS_A", "elementary individual substance")
+    ]
 ]
+
+biology_list = [c.capitalize() for c in biology_list]
+philosophy_list = [c.capitalize() for c in philosophy_list]
+
 # Ensure all subjects/objects from triples are in concepts for completeness
 for s,_,o in SAMPLE_TRIPLES_TO_LOAD:
     if s not in SAMPLE_CONCEPTS_TO_LOAD: SAMPLE_CONCEPTS_TO_LOAD.append(s)
     if o not in SAMPLE_CONCEPTS_TO_LOAD: SAMPLE_CONCEPTS_TO_LOAD.append(o)
-# Add the predefined biology/philosophy list concepts to ensure they are domains are set if only sample data is loaded.
 for concept in biology_list:
     if concept not in SAMPLE_CONCEPTS_TO_LOAD: SAMPLE_CONCEPTS_TO_LOAD.append(concept)
 for concept in philosophy_list:
     if concept not in SAMPLE_CONCEPTS_TO_LOAD: SAMPLE_CONCEPTS_TO_LOAD.append(concept)
-SAMPLE_CONCEPTS_TO_LOAD = list(set(SAMPLE_CONCEPTS_TO_LOAD)) # Remove duplicates again
+SAMPLE_CONCEPTS_TO_LOAD = sorted(list(set(SAMPLE_CONCEPTS_TO_LOAD))) # Remove duplicates and sort
 
 def connect_to_neo4j():
     """Establishes a connection to the Neo4j database and stores it in session_state."""
@@ -275,43 +328,63 @@ def load_concepts_to_neo4j(graph, concept_domain_map): # Modified signature
         graph.rollback(tx)
         return 0
 
-def load_triples_to_neo4j(graph, triples):
-    """Loads a list of (subject, relationship, object) triples into Neo4j."""
-    if not graph:
-        print("Neo4j connection not available. Skipping triple loading.")
-        return 0 # Return 0 if graph is None
-    
-    tx = graph.begin()
+def load_triples_to_neo4j(
+    graph_conn, 
+    triples: Iterable[list[str]], # Changed from tuple to list for consistency
+    node_label: str = "Concept"
+) -> int:
+    """
+    Loads a list of triples into Neo4j, enforcing the schema for relationships.
+    Uses the _canonical_rel helper to map relationships to allowed types.
+    Args:
+        graph_conn: Active Neo4j graph connection.
+        triples (Iterable[list[str]]): An iterable of [Subject, Relationship, Object] lists.
+        node_label (str): The Neo4j label to use for concept nodes.
+    Returns:
+        int: The number of triples successfully loaded.
+    """
     loaded_count = 0
-    for subj, rel, obj in triples:
-        # Ensure relationship type is a valid label (uppercase, no spaces, etc.)
-        # This is a simple sanitization, might need more robust handling
-        rel_type = rel.upper().replace(" ", "_").replace("-", "_") 
-        if not rel_type.isidentifier(): # Basic check for valid Cypher label
-            print(f"Skipping invalid relationship type: {rel_type} from triple ({subj}, {rel}, {obj})")
-            continue
+    if not graph_conn:
+        logging.error("Neo4j graph connection not available in load_triples_to_neo4j.")
+        st.error("Neo4j connection not available. Cannot load triples.")
+        return 0
 
-        # MERGE nodes first to ensure they exist (concept loading should ideally handle this)
-        subj_domain = get_concept_domain(subj)
-        obj_domain = get_concept_domain(obj)
-        tx.run("MERGE (s:Concept {name: $name}) SET s.domain = $domain", name=subj, domain=subj_domain)
-        tx.run("MERGE (o:Concept {name: $name}) SET o.domain = $domain", name=obj, domain=obj_domain)
-        
-        # MERGE the relationship
-        query = f"""
-        MATCH (s:Concept {{name: $sub}}), (o:Concept {{name: $obj}})
-        MERGE (s)-[r:{rel_type}]->(o)
-        """
-        tx.run(query, sub=subj, obj=obj)
-        loaded_count += 1
+    tx = None
     try:
-        graph.commit(tx)
-        print(f"Successfully loaded/merged {loaded_count} relationships into Neo4j.")
-        return loaded_count # Return count on success
+        tx = graph_conn.begin()
+        for subj, rel_raw, obj in triples: # rel_raw to signify it's before canonicalization
+            # Concept names (subj, obj) are assumed to be normalized by extract_meaning_atoms_gemini
+            
+            # Get canonical relationship type
+            rel_type = _canonical_rel(rel_raw) 
+            
+            # Ensure rel_type for Neo4j is a valid identifier (no spaces unless backticked)
+            # Our ALLOWED_RELATIONSHIP_TYPES are underscore_separated or single words, so this is fine.
+            
+            query = f"""
+            MERGE (s:{node_label} {{name: $subj}})
+            MERGE (o:{node_label} {{name: $obj}})
+            MERGE (s)-[r:{rel_type}]->(o)
+            """
+            tx.run(query, subj=subj, obj=obj)
+            loaded_count += 1
+        graph_conn.commit(tx)
+        logging.info(f"Successfully loaded {loaded_count} triples into Neo4j.")
+        if loaded_count > 0:
+            st.success(f"Loaded {loaded_count} new relationships into the graph.")
     except Exception as e:
-        print(f"Error committing relationships to Neo4j: {e}")
-        graph.rollback(tx)
+        error_msg = f"Error loading triples to Neo4j: {e}"
+        logging.error(error_msg)
+        st.error(error_msg)
+        if tx:
+            try:
+                graph_conn.rollback(tx)
+                logging.info("Rolled back transaction due to error.")
+            except Exception as rb_e:
+                logging.error(f"Error during transaction rollback: {rb_e}")
         return 0 # Return 0 on error
+        
+    return loaded_count
 
 # --- Section 3.3: Generating Embeddings for Concepts ---
 def initialize_embedding_model(model_name='sentence-transformers/all-MiniLM-L6-v2'):
@@ -746,6 +819,256 @@ Categorized Concepts:
         # Fallback: assign "General" to all concepts
         return {concept: "General" for concept in concepts_list}
 
+# --- NEW Function: Get Concept Features from Neo4j (for Blending) ---
+def get_concept_features_neo4j(graph_conn, concept_name: str, max_features: int = 10) -> List[str]:
+    """
+    Retrieves 1-hop features (relationships and connected nodes) for a concept from Neo4j.
+    Formats them as strings for use in LLM prompts.
+    Args:
+        graph_conn: Active Neo4j graph connection.
+        concept_name (str): The name of the concept to get features for.
+        max_features (int): Maximum number of features (triples) to retrieve.
+    Returns:
+        List[str]: A list of strings, where each string represents a feature triple.
+                   e.g., ["ConceptA IS_A Entity", "ConceptA HAS_PART PartX"]
+    """
+    if not graph_conn:
+        logging.warning(f"Neo4j connection not available for get_concept_features_neo4j('{concept_name}').")
+        return []
+    
+    features = []
+    try:
+        # Query for outgoing and incoming relationships up to max_features/2 each to try and get a balance
+        # Ensure relationship types are from our schema for consistency in feature description.
+        query = f"""
+        MATCH (c:Concept {{name: $concept_name}})-[r]->(neighbor:Concept)
+        WHERE type(r) IN $allowed_types_param
+        RETURN c.name AS source, type(r) AS relationship, neighbor.name AS target
+        LIMIT $limit_param
+        UNION ALL
+        MATCH (neighbor:Concept)-[r]->(c:Concept {{name: $concept_name}})
+        WHERE type(r) IN $allowed_types_param
+        RETURN neighbor.name AS source, type(r) AS relationship, c.name AS target
+        LIMIT $limit_param
+        """
+        
+        # Convert set to list for Neo4j parameter
+        allowed_types_list = list(ALLOWED_RELATIONSHIP_TYPES)
+
+        results = graph_conn.run(query, 
+                                 concept_name=concept_name, 
+                                 limit_param=max_features, # Total limit, but applied to each part of UNION
+                                 allowed_types_param=allowed_types_list
+                                 ).data()
+        
+        for record in results:
+            # Ensure all parts are strings and not None before joining
+            source = str(record['source']) if record['source'] else 'Unknown'
+            relationship = str(record['relationship']) if record['relationship'] else 'RELATED_TO'
+            target = str(record['target']) if record['target'] else 'Unknown'
+            features.append(f"{source}; {relationship}; {target}")
+        
+        # Deduplicate and limit again in case UNION ALL limit behavior is not exact
+        unique_features = sorted(list(set(features)))
+        logging.info(f"Retrieved {len(unique_features)} unique features for concept '{concept_name}'.")
+        return unique_features[:max_features]
+
+    except Exception as e:
+        logging.error(f"Error retrieving features for '{concept_name}' from Neo4j: {e}")
+        st.error(f"Error getting features for {concept_name}: {e}")
+        return []
+# --- END NEW Function ---
+
+# --- NEW Function: Blend Concepts with Gemini ---
+def blend_concepts_gemini(concept_a_name: str, concept_a_features: List[str], 
+                        concept_b_name: str, concept_b_features: List[str],
+                        gemini_model_to_use) -> Optional[Dict[str, any]]:
+    """
+    Uses Gemini to generate a conceptual blend of two concepts based on their features.
+
+    Args:
+        concept_a_name (str): Name of the first concept.
+        concept_a_features (List[str]): List of feature strings for concept A.
+        concept_b_name (str): Name of the second concept.
+        concept_b_features (List[str]): List of feature strings for concept B.
+        gemini_model_to_use: The initialized Gemini model instance.
+
+    Returns:
+        Optional[Dict[str, any]]: A dictionary containing the blended concept's details
+                                  (name, description, features, emergent_properties)
+                                  or None if an error occurs.
+    """
+    if not gemini_model_to_use:
+        st.error("Gemini model not available for blending.")
+        logging.error("blend_concepts_gemini: Gemini model not provided.")
+        return None
+
+    # Prepare feature strings for the prompt
+    features_a_str = "\n".join([f"- {f}" for f in concept_a_features]) if concept_a_features else "No specific features provided."
+    features_b_str = "\n".join([f"- {f}" for f in concept_b_features]) if concept_b_features else "No specific features provided."
+
+    prompt = dedent(f"""
+    You are a highly creative and insightful AI assistant specializing in conceptual blending and innovation.
+    Your task is to blend two concepts, Concept A and Concept B, into a novel, coherent, and meaningful new concept.
+
+    **Concept A: {concept_a_name}**
+    Known features and relationships:
+    {features_a_str}
+
+    **Concept B: {concept_b_name}**
+    Known features and relationships:
+    {features_b_str}
+
+    **Your Task:**
+    1.  **Invent a Name:** Create a concise and imaginative name for the new blended concept that reflects both Concept A and Concept B.
+    2.  **Describe the Blend:** Provide a rich description of this new blended concept. Explain how it combines aspects of Concept A and Concept B.
+    3.  **Identify Key Features:** List 3-5 key features or characteristics of this blended concept. These should be specific and clearly derived from the blend.
+    4.  **Highlight Emergent Properties:** Most importantly, describe any **emergent properties** or novel capabilities this blend possesses. What can the blended concept do, or what unique quality does it have, that neither Concept A nor Concept B can achieve on their own? What new niche does it fill, or what problem does it solve?
+    5.  **Structure your output EXACTLY as follows, using these specific headers:**
+
+        **Blended Concept Name:**
+        [Your inventive name here]
+
+        **Blended Concept Description:**
+        [Your detailed description of the blended concept here]
+
+        **Key Features of Blend:**
+        - [Feature 1]
+        - [Feature 2]
+        - [Feature 3]
+        (List 3-5 features)
+
+        **Emergent Properties:**
+        [Your description of emergent properties and novel capabilities here]
+
+    Focus on creativity, coherence, and the insightful generation of emergent properties. The goal is to produce a truly novel concept.
+    """)
+
+    try:
+        logging.info(f"Sending blend request to Gemini for '{concept_a_name}' and '{concept_b_name}'.")
+        response = gemini_model_to_use.generate_content(prompt)
+        
+        if not response.candidates or not response.text:
+            raw_gemini_output_text = "Gemini response was empty or blocked for blending. Check safety settings or prompt."
+            logging.warning(raw_gemini_output_text)
+            if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                 raw_gemini_output_text += f" Prompt Feedback: {response.prompt_feedback}"
+            st.error(raw_gemini_output_text)
+            return None
+
+        raw_response_text = response.text.strip()
+        logging.info(f"Gemini blend response received: {raw_response_text[:500]}...") 
+
+        blended_data = {}
+        current_section = None
+        full_parsed_content = [] # For debugging
+
+        for line_num, raw_line in enumerate(raw_response_text.splitlines()):
+            line = raw_line.strip()
+            logging.debug(f"BLEND_PARSE Line {line_num}: '{line}' | Current Section: {current_section}")
+
+            if line.startswith("**Blended Concept Name:**"):
+                current_section = "name"
+                blended_data['name'] = line.replace("**Blended Concept Name:**", "").strip()
+                logging.debug(f"  -> Parsed Name: {blended_data['name']}")
+            elif line.startswith("**Blended Concept Description:**"):
+                current_section = "description"
+                # Initialize with the first part, subsequent lines will append
+                blended_data['description'] = line.replace("**Blended Concept Description:**", "").strip()
+                logging.debug(f"  -> Parsed Description (start): {blended_data['description']}")
+            elif line.startswith("**Key Features of Blend:**"):
+                current_section = "features"
+                features_list = [] # Initialize here for each blend attempt
+                logging.debug(f"  -> Switched to Features section")
+            elif line.startswith("**Emergent Properties:**"):
+                current_section = "emergent_properties"
+                # Initialize with the first part, subsequent lines will append
+                blended_data['emergent_properties'] = line.replace("**Emergent Properties:**", "").strip()
+                logging.debug(f"  -> Parsed Emergent Properties (start): {blended_data['emergent_properties']}")
+            elif current_section:
+                if current_section == "name": # Should ideally be captured by the startswith
+                    if not blended_data.get('name'): # If somehow missed by startswith but section is name
+                        blended_data['name'] = line
+                        logging.debug(f"  -> Appended to Name (fallback): {line}")
+                    # else: already captured, or this line is something else.
+                elif current_section == "description":
+                    blended_data['description'] += " " + line 
+                    logging.debug(f"  -> Appended to Description: {line}")
+                elif current_section == "features" and line.startswith("-"):
+                    feature_to_add = line[1:].strip()
+                    if feature_to_add:
+                        features_list.append(feature_to_add)
+                        logging.debug(f"  -> Added Feature: {feature_to_add}")
+                elif current_section == "emergent_properties":
+                    blended_data['emergent_properties'] += " " + line
+                    logging.debug(f"  -> Appended to Emergent Properties: {line}")
+            full_parsed_content.append(line) # For debugging
+        
+        blended_data['features'] = features_list # Assign collected features
+        blended_data['_debug_full_parsed_content'] = "\n".join(full_parsed_content) # Add for debugging output
+
+        if not blended_data.get('name') or not blended_data.get('description'):
+            logging.warning(f"Could not parse essential fields (name/description) from Gemini blend response: {raw_response_text}")
+            st.warning("Could not fully parse the blend response from Gemini. The structure might be unexpected.")
+            blended_data['raw_response'] = raw_response_text 
+            if not blended_data.get('name'): blended_data['name'] = "Unnamed Blend"
+            if not blended_data.get('description'): blended_data['description'] = raw_response_text 
+        return blended_data
+
+    except Exception as e:
+        logging.error(f"Error during Gemini conceptual blending for '{concept_a_name}' and '{concept_b_name}': {e}")
+        st.error(f"Error generating conceptual blend: {e}")
+        return None
+# --- END NEW Function ---
+
+# --- Prompt Helper for Extractor (from user patch) ---
+# ... existing code ...
+
+# --- Tab 2: Analogical Search & Query ---
+# ... (UI setup for blending already added) ...
+    if st.button("Blend Concepts with Gemini", key="blend_concepts_button"):
+        if concept_a_blend and concept_b_blend:
+            st.info(f"Attempting to blend '{concept_a_blend}' and '{concept_b_blend}'...")
+            # ... (get graph_conn_blend, gemini_model_blend) ...
+            if not graph_conn_blend:
+                st.error("Neo4j connection not available for blending.")
+            elif not gemini_model_blend:
+                st.error("Gemini model not available for blending.")
+            else:
+                # ... (get features_a, features_b) ...
+                # Now call the blend_concepts_gemini function
+                blended_result = blend_concepts_gemini(concept_a_blend, features_a, 
+                                                       concept_b_blend, features_b, 
+                                                       gemini_model_blend)
+                
+                if blended_result:
+                    st.session_state.current_blend_result = blended_result # Store in session state
+                    st.subheader(f"Blended Concept: {blended_result.get('name', 'Unnamed Blend')}")
+                    st.markdown("**Description:**")
+                    st.write(blended_result.get('description', 'No description provided.'))
+                    
+                    if blended_result.get('features'):
+                        st.markdown("**Key Features of Blend:**")
+                        for feature_item in blended_result.get('features', []):
+                            st.markdown(f"- {feature_item}")
+                    
+                    if blended_result.get('emergent_properties'):
+                        st.markdown("**Emergent Properties:**")
+                        st.write(blended_result.get('emergent_properties', 'None specified.'))
+                    
+                    # Placeholder for "Add to Graph" button - to be implemented next
+                    if st.button("Add Blended Concept to Knowledge Graph", key="add_blend_to_graph_button"):
+                        st.info("Functionality to add blend to graph to be implemented.")
+                        # Call a new function: add_blended_concept_to_graph(graph_conn_blend, blended_result, concept_a_blend, concept_b_blend)
+
+                else:
+                    st.error("Failed to generate a blend from Gemini.")
+                    st.session_state.current_blend_result = None
+        else:
+            st.warning("Please enter both Concept A and Concept B for blending.")
+    # --- END Conceptual Blending Section ---
+# ... existing code ...
+
 # --- Initialization code for Streamlit app (run once at the start) ---
 if 'app_initialized' not in st.session_state:
     print("--- POLYMIND Application Initializing --- ")
@@ -768,9 +1091,19 @@ if 'app_initialized' not in st.session_state:
                 print("Neo4j is empty. Loading sample data for initialization...")
                 st.info("Neo4j database appears empty. Loading sample concepts and relationships for demonstration.")
                 
-                # For now, we still load predefined samples.
-                # In a future step, we could process a sample text with Gemini here.
-                load_concepts_to_neo4j(current_graph_db_connection, SAMPLE_CONCEPTS_TO_LOAD)
+                # Create a domain map for sample concepts
+                sample_concept_domain_map = {}
+                for concept_name in SAMPLE_CONCEPTS_TO_LOAD:
+                    if concept_name in biology_list:
+                        sample_concept_domain_map[concept_name] = "Biology"
+                    elif concept_name in philosophy_list:
+                        sample_concept_domain_map[concept_name] = "Philosophy"
+                    else:
+                        sample_concept_domain_map[concept_name] = "General"
+                
+                # Load concepts with their domains
+                load_concepts_to_neo4j(current_graph_db_connection, sample_concept_domain_map)
+                # Load triples (relationships will be canonicalized by load_triples_to_neo4j)
                 load_triples_to_neo4j(current_graph_db_connection, SAMPLE_TRIPLES_TO_LOAD)
                 print("Sample data loaded into Neo4j.")
                 st.success("Sample data loaded into Neo4j for first-time setup.")
@@ -1133,7 +1466,6 @@ with tab2:
     if user_query_tab2:
         ui_embed_model = st.session_state.get('embed_model')
         ui_faiss_index = st.session_state.get('faiss_index')
-        # ui_concept_list_for_faiss = st.session_state.get('concept_list_for_faiss', []) # Not directly used in the new flow here
         ui_graph_db_connection = st.session_state.get('graph_db_connection')
         gemini_model_instance = st.session_state.get("gemini_model")
 
@@ -1143,14 +1475,14 @@ with tab2:
         extracted_concept_tab2 = None
         target_domain_query_tab2 = None
 
-        # Simplified regex, removing optional quotes to isolate linter issue
-        pattern_str_tab2 = r"^(?:Analogy for\s+)?(?P<concept>[A-Za-z0-9\s\-]+?)(?:\s+in\s+(?P<domain>[A-Za-z\s]+))?$"
+        # Simplified regex, removing optional quotes to isolate linter issue, and allowing optional trailing question mark
+        pattern_str_tab2 = r"^(?:Analogy for\s+)?(?P<concept>[A-Za-z0-9\s\-]+?)(?:\s+in\s+(?P<domain>[A-Za-z\s]+))?\??$"
 
         analogy_query_match_tab2 = re.search(pattern_str_tab2, user_query_tab2, re.IGNORECASE)
 
         if analogy_query_match_tab2:
             is_analogy_query = True
-            extracted_concept_tab2 = analogy_query_match_tab2.group("concept").strip()
+            extracted_concept_tab2 = analogy_query_match_tab2.group("concept").strip().capitalize() # Normalize here
             if analogy_query_match_tab2.group("domain"):
                 target_domain_query_tab2 = analogy_query_match_tab2.group("domain").strip().capitalize()
             st.write(f"Detected concept for analogy: **{extracted_concept_tab2}**" + (f" (aiming for domain: {target_domain_query_tab2})" if target_domain_query_tab2 else ""))
@@ -1165,9 +1497,8 @@ with tab2:
 
         if is_analogy_query and extracted_concept_tab2:
             analogy_found = False
-            analogy_type = "" # To store "Structural" or "Vector-based"
+            analogy_type = "" 
 
-            # --- Primary: Structural Analogy Search ---
             if ui_graph_db_connection:
                 with st.spinner(f"Searching for concepts structurally similar to '{extracted_concept_tab2}'..."):
                     structural_analogs = find_analogous_concept_structural_graph(
@@ -1184,7 +1515,7 @@ with tab2:
                     analog_concept = top_structural_analog['analogous_concept']
                     analog_domain = top_structural_analog['analogous_domain']
                     
-                    st.subheader(f"Analogy Found ({analogy_type})")
+                    st.subheader(f"Analogy Found (Structurally Derived)")
                     st.write(f"Source Concept: **{extracted_concept_tab2}** (Domain: {get_concept_domain(extracted_concept_tab2)})" +
                              f"\\nAnalogous Concept: **{analog_concept}** (Domain: {analog_domain})")
                     st.write(f"Shared Pattern Types: {top_structural_analog['num_shared_neighbors']}")
@@ -1221,14 +1552,7 @@ with tab2:
                             )
                         st.markdown("### Gemini's Explanation (Structural)")
                         st.markdown(explanation)
-                    else:
-                        st.warning("Gemini model not available to generate a detailed explanation.")
-                else:
-                    st.info(f"No strong structural analogies found for '{extracted_concept_tab2}'. Trying vector-based search...")
-            else:
-                st.warning("Neo4j connection not available. Cannot perform structural analogy search. Trying vector-based search...")
 
-            # --- Fallback: Vector-based Analogy Search ---
             if not analogy_found:
                 if not ui_embed_model or not ui_faiss_index:
                     st.error("Embedding model or FAISS index not ready. Cannot perform vector analogy search.")
@@ -1240,11 +1564,9 @@ with tab2:
                         analog_concept = vector_analog_result['concept']
                         analog_domain = vector_analog_result['domain']
                         similarity = vector_analog_result.get('similarity', 0.0)
-
-                        st.subheader(f"Analogy Found ({analogy_type})")
+                        st.subheader(f"Analogy Found (Semantically Similar (Vector-based))")
                         st.write(f"Source Concept: **{extracted_concept_tab2}** (Domain: {get_concept_domain(extracted_concept_tab2)})" +
                                  f"\\nAnalogous Concept: **{analog_concept}** (Domain: {analog_domain}, Similarity: {similarity:.4f})")
-
                         if gemini_model_instance:
                             with st.spinner("Gemini is crafting an explanation for the vector-based analogy..."):
                                 explanation = generate_analogy_explanation_gemini(
@@ -1256,14 +1578,252 @@ with tab2:
                                 )
                             st.markdown("### Gemini's Explanation (Vector-based)")
                             st.markdown(explanation)
-                        else:
-                            st.warning("Gemini model not available to generate a detailed explanation.")
-                    else:
-                        st.write(f"Sorry, no strong vector-based analogy found for **{extracted_concept_tab2}** in a different domain either.")
             
-            # --- Display Graph Context if Analogy Found ---
             if analogy_found and ui_graph_db_connection:
-                st.subheader(f"Knowledge Graph Context for '{extracted_concept_tab2}' and '{analog_concept}' ({analogy_type})")
+                st.subheader(f"Knowledge Graph Context for '{extracted_concept_tab2}' and '{analog_concept}'")
+                try:
+                    subG = nx.Graph()
+                    nodes_to_fetch = [
+                        (extracted_concept_tab2, get_concept_domain(extracted_concept_tab2)), 
+                        (analog_concept, analog_domain) # analog_concept and analog_domain are set by either structural or vector search
+                    ]
+                    
+                    for node_name, node_domain_val in nodes_to_fetch: # Renamed node_domain to node_domain_val
+                        subG.add_node(node_name, domain=node_domain_val, name=node_name, size=20)
+                        query_neighbors = """
+                        MATCH (n:Concept {name:$name})-[r]-(m:Concept)
+                        RETURN m.name AS neighbor_name, m.domain AS neighbor_domain, type(r) as rel_type
+                        LIMIT 7 """ 
+                        results_struct = ui_graph_db_connection.run(query_neighbors, name=node_name).data()
+                        for record in results_struct:
+                            neigh_name = record['neighbor_name']
+                            neigh_domain_val = record['neighbor_domain'] # Renamed
+                            rel_type = record['rel_type']
+                            if not subG.has_node(neigh_name):
+                                subG.add_node(neigh_name, domain=neigh_domain_val, name=neigh_name, size=10)
+                            if not subG.has_edge(node_name, neigh_name):
+                                subG.add_edge(node_name, neigh_name, label=rel_type)
+                    
+                    if subG.number_of_nodes() > 0:
+                        plt.figure(figsize=(10, 7))
+                        pos_struct = nx.spring_layout(subG, k=0.5, iterations=50)
+                        domain_colors = {"Biology": "skyblue", "Philosophy": "salmon", "General": "lightgray"}
+                        node_colors_list_struct = [domain_colors.get(subG.nodes[n]['domain'], "lightgray") for n in subG.nodes()]
+                        node_sizes_list_struct = [subG.nodes[n]['size'] for n in subG.nodes()]
+                        labels_struct = {n: subG.nodes[n]['name'] for n in subG.nodes()}
+
+                        nx.draw(subG, pos_struct, with_labels=True, labels=labels_struct, 
+                                node_color=node_colors_list_struct, node_size=node_sizes_list_struct, 
+                                font_size=9, width=0.5, edge_color='gray')
+                        # Use the correctly parsed/found concept and analog for the title
+                        title_concept_name = extracted_concept_tab2 if extracted_concept_tab2 else "Source"
+                        title_analog_name = analog_concept if analog_concept else "Analog"
+                        plt.title(f"Analogy Graph: {title_concept_name} & {title_analog_name}")
+                        st.pyplot(plt.gcf())
+                        plt.clf()
+                    else:
+                        st.info("Could not retrieve sufficient graph context for visualization.")
+                except Exception as e:
+                    st.error(f"Error generating graph visualization: {e}")
+                    print(f"Error generating graph visualization: {e}")
+            elif analogy_found and not ui_graph_db_connection:
+                 st.warning("Neo4j not connected. Cannot display graph context for the found analogy.")
+            elif not analogy_found:
+                st.info(f"No analogy (neither structural nor vector-based) could be established for '{extracted_concept_tab2}'.")
+
+        elif is_analogy_query and not extracted_concept_tab2: 
+             st.warning("Could not identify the main concept for your analogy query. Please try rephrasing.")
+        else: 
+            st.info("This tab primarily supports analogy queries like 'Analogy for DNA in philosophy?'.")
+
+        # --- NEW Conceptual Blending Section in Tab 2 (Ensuring it's outside any function) ---
+        st.markdown("---") 
+        st.subheader("🧪 Conceptual Blending")
+        st.markdown("Enter two concepts below to attempt a conceptual blend using Gemini.")
+
+        col1_blend, col2_blend = st.columns(2)
+        with col1_blend:
+            concept_a_blend_input = st.text_input("Concept A for Blending:", key="concept_a_blend_input")
+        with col2_blend:
+            concept_b_blend_input = st.text_input("Concept B for Blending:", key="concept_b_blend_input")
+
+        if st.button("Blend Concepts with Gemini", key="blend_concepts_button"):
+            if concept_a_blend_input and concept_b_blend_input:
+                concept_a_blend = concept_a_blend_input.strip().capitalize() # Normalize here
+                concept_b_blend = concept_b_blend_input.strip().capitalize() # Normalize here
+                st.info(f"Attempting to blend '{concept_a_blend}' and '{concept_b_blend}'...")
+                graph_conn_blend = st.session_state.get("graph_db_connection")
+                gemini_model_blend = st.session_state.get("gemini_model")
+
+                if not graph_conn_blend:
+                    st.error("Neo4j connection not available for blending.")
+                elif not gemini_model_blend:
+                    st.error("Gemini model not available for blending.")
+                else:
+                    st.write(f"Retrieving features for Concept A: {concept_a_blend}...")
+                    features_a = get_concept_features_neo4j(graph_conn_blend, concept_a_blend)
+                    if not features_a:
+                        st.warning(f"Could not retrieve features for '{concept_a_blend}' or it has no connections.")
+                    else:
+                        st.write(f"Found {len(features_a)} features for {concept_a_blend}:")
+                        with st.expander(f"Show features for {concept_a_blend}"):
+                            st.json(features_a)
+                    
+                    st.write(f"Retrieving features for Concept B: {concept_b_blend}...")
+                    features_b = get_concept_features_neo4j(graph_conn_blend, concept_b_blend)
+                    if not features_b:
+                        st.warning(f"Could not retrieve features for '{concept_b_blend}' or it has no connections.")
+                    else:
+                        st.write(f"Found {len(features_b)} features for {concept_b_blend}:")
+                        with st.expander(f"Show features for {concept_b_blend}"):
+                            st.json(features_b)
+
+                    blended_result = blend_concepts_gemini(concept_a_blend, features_a, 
+                                                           concept_b_blend, features_b, 
+                                                           gemini_model_blend)
+                    
+                    if blended_result:
+                        st.session_state.current_blend_result = blended_result 
+                        st.subheader(f"Blended Concept: {blended_result.get('name', 'Unnamed Blend')}")
+                        st.markdown("**Description:**")
+                        st.write(blended_result.get('description', 'No description provided.'))
+                        
+                        if blended_result.get('features'):
+                            st.markdown("**Key Features of Blend:**")
+                            for feature_item in blended_result.get('features', []):
+                                st.markdown(f"- {feature_item}")
+                        
+                        if blended_result.get('emergent_properties'):
+                            st.markdown("**Emergent Properties:**")
+                            st.write(blended_result.get('emergent_properties', 'None specified.'))
+                        
+                        if st.button("Add Blended Concept to Knowledge Graph", key="add_blend_to_graph_button"):
+                            st.info("Functionality to add blend to graph to be implemented.")
+                    else:
+                        st.error("Failed to generate a blend from Gemini.")
+                        st.session_state.current_blend_result = None
+            else:
+                st.warning("Please enter both Concept A and Concept B for blending.")
+        # --- END Conceptual Blending Section ---
+
+    if user_query_tab2: # Moved the analogy search processing below the blending UI setup
+        ui_embed_model = st.session_state.get('embed_model')
+        ui_faiss_index = st.session_state.get('faiss_index')
+        ui_graph_db_connection = st.session_state.get('graph_db_connection')
+        gemini_model_instance = st.session_state.get("gemini_model")
+
+        st.write(f"Processing query: {user_query_tab2}")
+        
+        is_analogy_query = False
+        extracted_concept_tab2 = None
+        target_domain_query_tab2 = None
+
+        # Simplified regex, removing optional quotes to isolate linter issue, and allowing optional trailing question mark
+        pattern_str_tab2 = r"^(?:Analogy for\s+)?(?P<concept>[A-Za-z0-9\s\-]+?)(?:\s+in\s+(?P<domain>[A-Za-z\s]+))?\??$"
+
+        analogy_query_match_tab2 = re.search(pattern_str_tab2, user_query_tab2, re.IGNORECASE)
+
+        if analogy_query_match_tab2:
+            is_analogy_query = True
+            extracted_concept_tab2 = analogy_query_match_tab2.group("concept").strip().capitalize() # Normalize here
+            if analogy_query_match_tab2.group("domain"):
+                target_domain_query_tab2 = analogy_query_match_tab2.group("domain").strip().capitalize()
+            st.write(f"Detected concept for analogy: **{extracted_concept_tab2}**" + (f" (aiming for domain: {target_domain_query_tab2})" if target_domain_query_tab2 else ""))
+        elif "analog" in user_query_tab2.lower() or "analogy" in user_query_tab2.lower():
+            is_analogy_query = True
+            concept_match_fallback_tab2 = re.search(r"\\b([A-Z][a-z]+(?:\\s[A-Z][a-z]+)*|DNA|RNA|Mind-body problem)\\b", user_query_tab2)
+            if concept_match_fallback_tab2:
+                extracted_concept_tab2 = concept_match_fallback_tab2.group(1).strip()
+                st.write(f"Detected concept (fallback): **{extracted_concept_tab2}**")
+            else:
+                st.warning("Could not clearly identify a concept for analogy. Please phrase as 'Analogy for [Concept Name] in [Domain]?' or use clearer terms.")
+
+        if is_analogy_query and extracted_concept_tab2:
+            analogy_found = False
+            analogy_type = "" 
+
+            if ui_graph_db_connection:
+                with st.spinner(f"Searching for concepts structurally similar to '{extracted_concept_tab2}'..."):
+                    structural_analogs = find_analogous_concept_structural_graph(
+                        ui_graph_db_connection, 
+                        extracted_concept_tab2, 
+                        target_domain_name=target_domain_query_tab2,
+                        k=3 
+                    )
+                
+                if structural_analogs:
+                    analogy_found = True
+                    analogy_type = "Structurally Derived"
+                    top_structural_analog = structural_analogs[0]
+                    analog_concept = top_structural_analog['analogous_concept']
+                    analog_domain = top_structural_analog['analogous_domain']
+                    
+                    st.subheader(f"Analogy Found (Structurally Derived)")
+                    st.write(f"Source Concept: **{extracted_concept_tab2}** (Domain: {get_concept_domain(extracted_concept_tab2)})" +
+                             f"\\nAnalogous Concept: **{analog_concept}** (Domain: {analog_domain})")
+                    st.write(f"Shared Pattern Types: {top_structural_analog['num_shared_neighbors']}")
+
+                    with st.expander("Show All Structural Analogs & Details"):
+                        for i, analog_info_detail in enumerate(structural_analogs):
+                            st.markdown(f"**{i+1}. {analog_info_detail['analogous_concept']}** (Domain: {analog_info_detail['analogous_domain']}) - Shared Neighbors: {analog_info_detail['num_shared_neighbors']}")
+                            for shared_node_detail in analog_info_detail['shared_neighbor_details']:
+                                shared_node = shared_node_detail.get('shared_node', 'Unknown Shared Node')
+                                path_src_list = shared_node_detail.get('path_from_source', [])
+                                paths_cand_list = shared_node_detail.get('paths_from_candidate', []) # This is a list of paths
+
+                                path_src_str = " -> ".join(path_src_list) if path_src_list else "N/A"
+                                
+                                # Show one example path from candidate
+                                path_cand_str = "N/A"
+                                if paths_cand_list and isinstance(paths_cand_list, list) and paths_cand_list[0].get('path_cand'):
+                                     path_cand_str = " -> ".join(paths_cand_list[0]['path_cand'])
+
+                                st.markdown(f"  - Shared Node: '{shared_node}'")
+                                st.write(f"     Path from '{extracted_concept_tab2}': {path_src_str}")
+                                st.write(f"     Example path from '{analog_concept}': {path_cand_str}")
+                            st.markdown("---")
+                    
+                    if gemini_model_instance:
+                        with st.spinner("Gemini is crafting an explanation for the structural analogy..."):
+                            explanation = generate_analogy_explanation_gemini(
+                                extracted_concept_tab2, 
+                                get_concept_domain(extracted_concept_tab2), 
+                                analog_concept, 
+                                analog_domain, 
+                                gemini_model_instance,
+                                shared_patterns_info=top_structural_analog 
+                            )
+                        st.markdown("### Gemini's Explanation (Structural)")
+                        st.markdown(explanation)
+
+            if not analogy_found:
+                if not ui_embed_model or not ui_faiss_index:
+                    st.error("Embedding model or FAISS index not ready. Cannot perform vector analogy search.")
+                else:
+                    vector_analog_result = find_analogous_concept_vector(extracted_concept_tab2) 
+                    if vector_analog_result:
+                        analogy_found = True
+                        analogy_type = "Semantically Similar (Vector-based)"
+                        analog_concept = vector_analog_result['concept']
+                        analog_domain = vector_analog_result['domain']
+                        similarity = vector_analog_result.get('similarity', 0.0)
+                        st.subheader(f"Analogy Found (Semantically Similar (Vector-based))")
+                        st.write(f"Source Concept: **{extracted_concept_tab2}** (Domain: {get_concept_domain(extracted_concept_tab2)})" +
+                                 f"\\nAnalogous Concept: **{analog_concept}** (Domain: {analog_domain}, Similarity: {similarity:.4f})")
+                        if gemini_model_instance:
+                            with st.spinner("Gemini is crafting an explanation for the vector-based analogy..."):
+                                explanation = generate_analogy_explanation_gemini(
+                                    extracted_concept_tab2, 
+                                    get_concept_domain(extracted_concept_tab2), 
+                                    analog_concept, 
+                                    analog_domain, 
+                                    gemini_model_instance
+                                )
+                            st.markdown("### Gemini's Explanation (Vector-based)")
+                            st.markdown(explanation)
+            
+            if analogy_found and ui_graph_db_connection:
+                st.subheader(f"Knowledge Graph Context for '{extracted_concept_tab2}' and '{analog_concept}'")
                 try:
                     subG = nx.Graph()
                     nodes_to_fetch = [

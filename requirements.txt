@@ -8,6 +8,7 @@ streamlit
 networkx
 matplotlib
 google-generativeai
+python-dotenv
 # For spacy model
 # python -m spacy download en_core_web_sm
 # For LLM (Mistral) - if using transformers pipeline directly
